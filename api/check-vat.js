@@ -1,4 +1,6 @@
 // api/check-vat.js
+const rateLimiter = new Map();
+
 export default async function handler(req, res) {
   // CORS Headers setzen
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -15,6 +17,40 @@ export default async function handler(req, res) {
   if (req.method !== 'GET' && req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
+
+  // Rate Limiting
+  const clientIP = req.headers['x-forwarded-for']?.split(',')[0] || 
+                   req.headers['x-real-ip'] || 
+                   req.connection?.remoteAddress || 
+                   'unknown';
+  const now = Date.now();
+  
+  // Prüfe Rate Limit (150 Requests pro Stunde pro IP)
+  if (rateLimiter.has(clientIP)) {
+    const requests = rateLimiter.get(clientIP).filter(time => now - time < 3600000);
+    if (requests.length >= 150) {
+      return res.status(429).json({ 
+        error: 'Zu viele Anfragen. Bitte versuchen Sie es später erneut.',
+        formatValid: false,
+        retryAfter: 3600
+      });
+    }
+    rateLimiter.set(clientIP, [...requests, now]);
+  } else {
+    rateLimiter.set(clientIP, [now]);
+  }
+
+  // Cleanup alte Einträge (gelegentlich)
+  if (Math.random() < 0.02) {
+    for (const [ip, times] of rateLimiter.entries()) {
+      const recentRequests = times.filter(time => now - time < 3600000);
+      if (recentRequests.length === 0) {
+        rateLimiter.delete(ip);
+      } else {
+        rateLimiter.set(ip, recentRequests);
+      }
+    }
+  }
   
   // Parameter aus Query (GET) oder Body (POST) holen
   const vatId = req.method === 'GET' 
@@ -24,13 +60,14 @@ export default async function handler(req, res) {
   if (!vatId) {
     return res.status(400).json({ 
       error: 'USt-ID ist erforderlich',
-      usage: 'GET /api/check-vat?vatId=DE123456789'
+      usage: 'GET /api/check-vat?vatId=DE123456789',
+      formatValid: false
     });
   }
   
   const cleanVatId = vatId.toString().replace(/\s/g, '').toUpperCase();
   
-  // Format-Validierung
+  // Format-Validierung (alle EU-Länder + XI)
   const vatFormats = {
     'AT': /^ATU\d{8}$/,
     'BE': /^BE(0\d{9}|\d{10})$/,
@@ -41,6 +78,7 @@ export default async function handler(req, res) {
     'DK': /^DK\d{8}$/,
     'EE': /^EE\d{9}$/,
     'GR': /^EL\d{9}$/,
+    'EL': /^EL\d{9}$/,
     'ES': /^ES[A-Z0-9]\d{7}[A-Z0-9]$/,
     'FI': /^FI\d{8}$/,
     'FR': /^FR[A-HJ-NP-Z0-9]{2}\d{9}$/,
@@ -58,7 +96,8 @@ export default async function handler(req, res) {
     'RO': /^RO\d{2,10}$/,
     'SE': /^SE\d{12}$/,
     'SI': /^SI\d{8}$/,
-    'SK': /^SK\d{10}$/
+    'SK': /^SK\d{10}$/,
+    'XI': /^XI\d{9}$/
   };
   
   const countryCode = cleanVatId.substring(0, 2);
@@ -83,9 +122,9 @@ export default async function handler(req, res) {
     });
   }
   
-  // EU VIES API aufrufen (Server-zu-Server, kein CORS!)
+  // EU VIES API aufrufen
   try {
-    console.log(`Prüfe USt-ID: ${cleanVatId}`);
+    console.log(`[${clientIP}] Prüfe USt-ID: ${cleanVatId}`);
     
     const viesUrl = `https://ec.europa.eu/taxation_customs/vies/rest-api/ms/${countryCode}/vat/${vatNumber}`;
     
@@ -94,7 +133,8 @@ export default async function handler(req, res) {
       headers: {
         'User-Agent': 'USt-ID-Prüfer/1.0',
         'Accept': 'application/json'
-      }
+      },
+      timeout: 10000
     });
     
     if (!response.ok) {
@@ -103,7 +143,7 @@ export default async function handler(req, res) {
     }
     
     const viesData = await response.json();
-    console.log('VIES Response:', viesData);
+    console.log(`[${clientIP}] VIES Response:`, { valid: viesData.valid, hasName: !!viesData.name });
     
     // Erfolgreiche Antwort
     return res.status(200).json({
@@ -119,7 +159,7 @@ export default async function handler(req, res) {
     });
     
   } catch (error) {
-    console.error('VIES API Fehler:', error);
+    console.error(`[${clientIP}] VIES API Fehler:`, error.message);
     
     // Bei API-Fehler: Format ist gültig, aber Prüfung fehlgeschlagen
     return res.status(200).json({
